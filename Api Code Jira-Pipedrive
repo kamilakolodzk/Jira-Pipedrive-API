@@ -1,0 +1,568 @@
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import json
+import logging
+from datetime import datetime
+import os
+from functools import wraps
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Configuration - Use environment variables for security
+JIRA_BASE_URL = os.getenv('JIRA_BASE_URL', 'https://yourcompany.atlassian.net')
+JIRA_EMAIL = os.getenv('JIRA_EMAIL', 'your-email@company.com')
+JIRA_API_TOKEN = os.getenv('JIRA_API_TOKEN', 'your-jira-api-token')
+
+PIPEDRIVE_BASE_URL = os.getenv('PIPEDRIVE_BASE_URL', 'https://yourcompany.pipedrive.com/api/v1')
+PIPEDRIVE_API_TOKEN = os.getenv('PIPEDRIVE_API_TOKEN', 'your-pipedrive-api-token')
+
+API_KEY = os.getenv('API_KEY', 'your-secure-api-key')  # For API authentication
+
+# Authentication decorator
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        if not api_key or api_key != API_KEY:
+            return jsonify({'error': 'Invalid API key'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+class JiraClient:
+    def __init__(self):
+        self.base_url = JIRA_BASE_URL
+        self.auth = (JIRA_EMAIL, JIRA_API_TOKEN)
+        self.headers = {'Content-Type': 'application/json'}
+
+    def get_issues(self, jql_query="", max_results=50):
+        """Get Jira issues"""
+        try:
+            url = f"{self.base_url}/rest/api/3/search"
+            params = {
+                'jql': jql_query,
+                'maxResults': max_results,
+                'fields': 'key,summary,status,assignee,created,updated,description,priority,reporter'
+            }
+            
+            response = requests.get(url, auth=self.auth, headers=self.headers, params=params)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Jira issues: {e}")
+            raise
+
+    def get_issue(self, issue_key):
+        """Get a specific Jira issue"""
+        try:
+            url = f"{self.base_url}/rest/api/3/issue/{issue_key}"
+            response = requests.get(url, auth=self.auth, headers=self.headers)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Jira issue {issue_key}: {e}")
+            raise
+
+    def create_issue(self, issue_data):
+        """Create a new Jira issue"""
+        try:
+            url = f"{self.base_url}/rest/api/3/issue"
+            
+            payload = {
+                "fields": {
+                    "project": {"key": issue_data.get('project_key', 'PROJ')},
+                    "summary": issue_data['summary'],
+                    "description": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [{
+                            "type": "paragraph",
+                            "content": [{
+                                "type": "text",
+                                "text": issue_data.get('description', '')
+                            }]
+                        }]
+                    },
+                    "issuetype": {"name": issue_data.get('issue_type', 'Task')},
+                    "priority": {"name": issue_data.get('priority', 'Medium')}
+                }
+            }
+            
+            if issue_data.get('assignee'):
+                payload["fields"]["assignee"] = {"accountId": issue_data['assignee']}
+            
+            response = requests.post(url, auth=self.auth, headers=self.headers, data=json.dumps(payload))
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error creating Jira issue: {e}")
+            raise
+
+    def update_issue(self, issue_key, update_data):
+        """Update a Jira issue"""
+        try:
+            url = f"{self.base_url}/rest/api/3/issue/{issue_key}"
+            
+            payload = {"fields": {}}
+            
+            if 'summary' in update_data:
+                payload["fields"]["summary"] = update_data['summary']
+            
+            if 'description' in update_data:
+                payload["fields"]["description"] = {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{
+                            "type": "text",
+                            "text": update_data['description']
+                        }]
+                    }]
+                }
+            
+            if 'priority' in update_data:
+                payload["fields"]["priority"] = {"name": update_data['priority']}
+            
+            response = requests.put(url, auth=self.auth, headers=self.headers, data=json.dumps(payload))
+            response.raise_for_status()
+            
+            return {"success": True}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error updating Jira issue {issue_key}: {e}")
+            raise
+
+class PipedriveClient:
+    def __init__(self):
+        self.base_url = PIPEDRIVE_BASE_URL
+        self.api_token = PIPEDRIVE_API_TOKEN
+
+    def get_deals(self, status="all_not_deleted", limit=100):
+        """Get Pipedrive deals"""
+        try:
+            url = f"{self.base_url}/deals"
+            params = {
+                'api_token': self.api_token,
+                'status': status,
+                'limit': limit
+            }
+            
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Pipedrive deals: {e}")
+            raise
+
+    def get_deal(self, deal_id):
+        """Get a specific Pipedrive deal"""
+        try:
+            url = f"{self.base_url}/deals/{deal_id}"
+            params = {'api_token': self.api_token}
+            
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Pipedrive deal {deal_id}: {e}")
+            raise
+
+    def create_deal(self, deal_data):
+        """Create a new Pipedrive deal"""
+        try:
+            url = f"{self.base_url}/deals"
+            
+            payload = {
+                'api_token': self.api_token,
+                'title': deal_data['title'],
+                'value': deal_data.get('value', 0),
+                'currency': deal_data.get('currency', 'USD'),
+                'status': deal_data.get('status', 'open')
+            }
+            
+            # Optional fields
+            if deal_data.get('stage_id'):
+                payload['stage_id'] = deal_data['stage_id']
+            if deal_data.get('person_id'):
+                payload['person_id'] = deal_data['person_id']
+            if deal_data.get('org_id'):
+                payload['org_id'] = deal_data['org_id']
+            
+            response = requests.post(url, data=payload)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error creating Pipedrive deal: {e}")
+            raise
+
+    def update_deal(self, deal_id, update_data):
+        """Update a Pipedrive deal"""
+        try:
+            url = f"{self.base_url}/deals/{deal_id}"
+            
+            payload = {'api_token': self.api_token}
+            payload.update(update_data)
+            
+            response = requests.put(url, data=payload)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error updating Pipedrive deal {deal_id}: {e}")
+            raise
+
+    def get_persons(self, limit=100):
+        """Get Pipedrive persons"""
+        try:
+            url = f"{self.base_url}/persons"
+            params = {
+                'api_token': self.api_token,
+                'limit': limit
+            }
+            
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Pipedrive persons: {e}")
+            raise
+
+    def create_person(self, person_data):
+        """Create a new Pipedrive person"""
+        try:
+            url = f"{self.base_url}/persons"
+            
+            payload = {
+                'api_token': self.api_token,
+                'name': person_data['name']
+            }
+            
+            # Optional fields
+            if person_data.get('email'):
+                payload['email'] = person_data['email']
+            if person_data.get('phone'):
+                payload['phone'] = person_data['phone']
+            if person_data.get('org_id'):
+                payload['org_id'] = person_data['org_id']
+            
+            response = requests.post(url, data=payload)
+            response.raise_for_status()
+            
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error creating Pipedrive person: {e}")
+            raise
+
+# Initialize clients
+jira_client = JiraClient()
+pipedrive_client = PipedriveClient()
+
+# API Routes
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+# Jira Endpoints
+@app.route('/api/jira/issues', methods=['GET'])
+@require_api_key
+def get_jira_issues():
+    """Get Jira issues"""
+    try:
+        jql = request.args.get('jql', '')
+        max_results = int(request.args.get('max_results', 50))
+        
+        result = jira_client.get_issues(jql, max_results)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/jira/issues/<issue_key>', methods=['GET'])
+@require_api_key
+def get_jira_issue(issue_key):
+    """Get a specific Jira issue"""
+    try:
+        result = jira_client.get_issue(issue_key)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/jira/issues', methods=['POST'])
+@require_api_key
+def create_jira_issue():
+    """Create a new Jira issue"""
+    try:
+        issue_data = request.json
+        
+        # Validate required fields
+        if not issue_data.get('summary'):
+            return jsonify({'error': 'Summary is required'}), 400
+        
+        result = jira_client.create_issue(issue_data)
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/jira/issues/<issue_key>', methods=['PUT'])
+@require_api_key
+def update_jira_issue(issue_key):
+    """Update a Jira issue"""
+    try:
+        update_data = request.json
+        result = jira_client.update_issue(issue_key, update_data)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Pipedrive Endpoints
+@app.route('/api/pipedrive/deals', methods=['GET'])
+@require_api_key
+def get_pipedrive_deals():
+    """Get Pipedrive deals"""
+    try:
+        status = request.args.get('status', 'all_not_deleted')
+        limit = int(request.args.get('limit', 100))
+        
+        result = pipedrive_client.get_deals(status, limit)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pipedrive/deals/<int:deal_id>', methods=['GET'])
+@require_api_key
+def get_pipedrive_deal(deal_id):
+    """Get a specific Pipedrive deal"""
+    try:
+        result = pipedrive_client.get_deal(deal_id)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pipedrive/deals', methods=['POST'])
+@require_api_key
+def create_pipedrive_deal():
+    """Create a new Pipedrive deal"""
+    try:
+        deal_data = request.json
+        
+        # Validate required fields
+        if not deal_data.get('title'):
+            return jsonify({'error': 'Title is required'}), 400
+        
+        result = pipedrive_client.create_deal(deal_data)
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pipedrive/deals/<int:deal_id>', methods=['PUT'])
+@require_api_key
+def update_pipedrive_deal(deal_id):
+    """Update a Pipedrive deal"""
+    try:
+        update_data = request.json
+        result = pipedrive_client.update_deal(deal_id, update_data)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pipedrive/persons', methods=['GET'])
+@require_api_key
+def get_pipedrive_persons():
+    """Get Pipedrive persons"""
+    try:
+        limit = int(request.args.get('limit', 100))
+        result = pipedrive_client.get_persons(limit)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pipedrive/persons', methods=['POST'])
+@require_api_key
+def create_pipedrive_person():
+    """Create a new Pipedrive person"""
+    try:
+        person_data = request.json
+        
+        # Validate required fields
+        if not person_data.get('name'):
+            return jsonify({'error': 'Name is required'}), 400
+        
+        result = pipedrive_client.create_person(person_data)
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Integration Endpoints
+@app.route('/api/sync/jira-to-pipedrive', methods=['POST'])
+@require_api_key
+def sync_jira_to_pipedrive():
+    """Sync Jira issues to Pipedrive deals"""
+    try:
+        sync_data = request.json
+        jql = sync_data.get('jql', 'status = Done')
+        
+        # Get Jira issues
+        jira_result = jira_client.get_issues(jql)
+        issues = jira_result.get('issues', [])
+        
+        # Get existing deals to avoid duplicates
+        pipedrive_result = pipedrive_client.get_deals()
+        existing_deals = pipedrive_result.get('data', []) or []
+        existing_titles = {deal['title'] for deal in existing_deals if deal}
+        
+        synced_deals = []
+        for issue in issues:
+            issue_key = issue['key']
+            issue_title = f"[{issue_key}] {issue['fields']['summary']}"
+            
+            # Skip if deal already exists
+            if issue_title in existing_titles:
+                continue
+            
+            # Create deal
+            deal_data = {
+                'title': issue_title,
+                'value': sync_data.get('default_value', 1000),
+                'currency': sync_data.get('currency', 'USD')
+            }
+            
+            created_deal = pipedrive_client.create_deal(deal_data)
+            if created_deal.get('success'):
+                synced_deals.append(created_deal['data'])
+        
+        return jsonify({
+            'success': True,
+            'synced_count': len(synced_deals),
+            'synced_deals': synced_deals
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/sync/pipedrive-to-jira', methods=['POST'])
+@require_api_key
+def sync_pipedrive_to_jira():
+    """Sync Pipedrive deals to Jira issues"""
+    try:
+        sync_data = request.json
+        project_key = sync_data.get('project_key', 'PROJ')
+        
+        # Get Pipedrive deals
+        pipedrive_result = pipedrive_client.get_deals()
+        deals = pipedrive_result.get('data', []) or []
+        
+        # Get existing issues to avoid duplicates
+        jira_result = jira_client.get_issues(f'project = {project_key}')
+        existing_issues = jira_result.get('issues', [])
+        existing_summaries = {issue['fields']['summary'] for issue in existing_issues}
+        
+        synced_issues = []
+        for deal in deals:
+            deal_title = deal['title']
+            issue_summary = f"Deal: {deal_title}"
+            
+            # Skip if issue already exists
+            if issue_summary in existing_summaries:
+                continue
+            
+            # Create issue
+            issue_data = {
+                'project_key': project_key,
+                'summary': issue_summary,
+                'description': f"Deal from Pipedrive\nValue: {deal.get('value', 'N/A')}\nStatus: {deal.get('status', 'N/A')}",
+                'issue_type': sync_data.get('issue_type', 'Task'),
+                'priority': sync_data.get('priority', 'Medium')
+            }
+            
+            created_issue = jira_client.create_issue(issue_data)
+            synced_issues.append(created_issue)
+        
+        return jsonify({
+            'success': True,
+            'synced_count': len(synced_issues),
+            'synced_issues': synced_issues
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Webhook Endpoints
+@app.route('/api/webhooks/jira', methods=['POST'])
+@require_api_key
+def jira_webhook():
+    """Handle Jira webhooks"""
+    try:
+        webhook_data = request.json
+        event_type = webhook_data.get('webhookEvent', '')
+        
+        logger.info(f"Received Jira webhook: {event_type}")
+        
+        # Process based on event type
+        if event_type == 'jira:issue_updated':
+            issue = webhook_data.get('issue', {})
+            if issue.get('fields', {}).get('status', {}).get('name') == 'Done':
+                # Auto-create deal when issue is done
+                deal_data = {
+                    'title': f"[{issue['key']}] {issue['fields']['summary']}",
+                    'value': 1000,
+                    'currency': 'USD'
+                }
+                pipedrive_client.create_deal(deal_data)
+        
+        return jsonify({'success': True, 'message': 'Webhook processed'})
+    except Exception as e:
+        logger.error(f"Error processing Jira webhook: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/webhooks/pipedrive', methods=['POST'])
+@require_api_key
+def pipedrive_webhook():
+    """Handle Pipedrive webhooks"""
+    try:
+        webhook_data = request.json
+        event = webhook_data.get('event', '')
+        
+        logger.info(f"Received Pipedrive webhook: {event}")
+        
+        # Process based on event type
+        if event == 'deal.won':
+            current_data = webhook_data.get('current', {})
+            # Auto-create Jira issue for won deals
+            issue_data = {
+                'project_key': 'PROJ',
+                'summary': f"Won Deal: {current_data.get('title', 'Unnamed Deal')}",
+                'description': f"Deal won in Pipedrive\nValue: {current_data.get('value', 'N/A')}",
+                'issue_type': 'Task',
+                'priority': 'High'
+            }
+            jira_client.create_issue(issue_data)
+        
+        return jsonify({'success': True, 'message': 'Webhook processed'})
+    except Exception as e:
+        logger.error(f"Error processing Pipedrive webhook: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    # Run the Flask application
+    app.run(debug=True, host='0.0.0.0', port=5000)
+Made with
